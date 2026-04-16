@@ -1,0 +1,217 @@
+#include 
+
+void Euler::Trapezoid(int type) {
+  double ttp1 = MPI_Wtime();
+  React.TrapezoidPrediction(TwoDim.Mc, TwoDim.Di, TwoDim.Yi, TwoDim.T,
+                            TwoDim.dt);
+  double ttp2 = MPI_Wtime();
+  dt4 += ttp2 - ttp1;
+  /* Dynamic Load Balance */
+  /* Reassign work load */
+  if (iteration % DLB_step == 0) {
+    DLB.NchemSumBalance = 0;
+    React.NchemSum = React.Nchem.SumNoBoundary(bc);
+    MPI_Allgather(&React.NchemSum, 1, MPI_INT, &React.NchemTotal(0), 1, MPI_INT,
+                  MPI_COMM_WORLD);
+    DLB.LoadDegree =
+        double((React.NchemTotal.MaxValue() - React.NchemTotal.AveValue())) /
+        React.NchemTotal.MaxValue();
+    if (myid == 0)
+      cout << "Load Degree: " << DLB.LoadDegree << endl;
+    if (DLB.LoadDegree > DLB_tol) {
+      DLB.transferNchem.clear();
+      /* get the transfer records */
+      DLB.DLBPriorityQueue(React.NchemTotal);
+      DLB.transferMeshNum.resize(DLB.transferNchem.size());
+      DLB.transferNmesh.resize(DLB.transferNchem.size());
+      std::fill(DLB.transferMeshNum.begin(), DLB.transferMeshNum.end(), 0);
+      std::fill(DLB.transferNmesh.begin(), DLB.transferNmesh.end(), 0);
+      DLB.transferPrevDataLocal.clear();
+      DLB.transferPrevData.clear();
+      DLB.transferPrevNchemLocal.clear();
+      DLB.transferPrevNchem.clear();
+      DLB.transferIndex.clear();
+      DLB.sentNmesh = 0;
+      DLB.prevFlowDataLocal.clear();
+      DLB.prevReactDataLocal.clear();
+    }
+  }
+  MPI_Request sendRequests1[DLB.transferNchem.size()];
+  MPI_Request sendRequests2[DLB.transferNchem.size()];
+  MPI_Request sendRequests3[DLB.transferNchem.size()];
+  MPI_Request recvRequests1[DLB.transferNchem.size()];
+  MPI_Request recvRequests2[DLB.transferNchem.size()];
+  MPI_Status statuses[DLB.transferNchem.size()];
+
+  for (int i = 0; i < DLB.transferNchem.size(); i++) {
+    sendRequests1[i] = MPI_REQUEST_NULL;
+    sendRequests2[i] = MPI_REQUEST_NULL;
+    sendRequests3[i] = MPI_REQUEST_NULL;
+    recvRequests1[i] = MPI_REQUEST_NULL;
+    recvRequests2[i] = MPI_REQUEST_NULL;
+  }
+  if (DLB.LoadDegree > DLB_tol) {
+    /* generate send and recv proc group */
+    DLB.GetProcGroup();
+    MPI_Group comm_group;
+    MPI_Comm_group(comm, &comm_group);
+    MPI_Group sendGroup;
+    MPI_Group recvGroup;
+    MPI_Group_incl(comm_group, DLB.sendId.size(), DLB.sendId.data(),
+                   &sendGroup);
+    MPI_Group_incl(comm_group, DLB.recvId.size(), DLB.recvId.data(),
+                   &recvGroup);
+
+    double tt1 = MPI_Wtime();
+    /* send myid judge transferIndex, package data, transfer mesh number */
+    int sentNchem = DLB.GetSentNchem(myid);
+    // cout << "\tmyid " << myid << " Nchem: " << sentNchem << endl;
+    if (sentNchem != 0) {
+      DLB.prevFlowDataLocal.clear();
+      DLB.prevReactDataLocal.clear();
+
+      std::vector<int> sendToTemp = DLB.sendTo;
+      int nchem_temp = 0, id = 0, start = 0, n = 0;
+
+      /* Get the transfer mesh number & transferIndex & package data */
+      if (iteration % DLB_step == 0) {
+        DLB.GetTransferMesh(React.Nchem, bc);
+        DLB.sentNmesh = std::accumulate(DLB.transferMeshNum.begin(),
+                                        DLB.transferMeshNum.end(), 0);
+      }
+      int x = 0, y = 0, z = 0;
+      for (int i = 0; i < DLB.transferIndex.size() / 3; i++) {
+        x = DLB.transferIndex[3 * i];
+        y = DLB.transferIndex[3 * i + 1];
+        z = DLB.transferIndex[3 * i + 2];
+        TwoDim.PackagePrev(DLB.prevFlowDataLocal, x, y, z);
+        React.PackagePrev(DLB.prevReactDataLocal, x, y, z);
+      }
+    }
+
+    MPI_Win win_prevFlowData;
+    MPI_Win win_prevReactData;
+    MPI_Win_create(DLB.prevFlowDataLocal.data(),
+                   sizeof(double) * DLB.prevFlowDataLocal.size(),
+                   sizeof(double), MPI_INFO_NULL, comm, &win_prevFlowData);
+    MPI_Win_create(DLB.prevReactDataLocal.data(),
+                   sizeof(int) * DLB.prevReactDataLocal.size(), sizeof(int),
+                   MPI_INFO_NULL, comm, &win_prevReactData);
+
+    double tt2 = MPI_Wtime();
+    dt1 += tt2 - tt1;
+    if (iteration % DLB_step ==
+        0) { /* reduce transfer mesh number to 0 process */
+      MPI_Reduce(DLB.transferMeshNum.data(), DLB.transferNmesh.data(),
+                 DLB.transferMeshNum.size(), MPI_INT, MPI_MAX, 0,
+                 MPI_COMM_WORLD);
+      MPI_Bcast(DLB.transferNmesh.data(), DLB.transferNmesh.size(), MPI_INT, 0,
+                MPI_COMM_WORLD);
+    }
+    double ttt1 = MPI_Wtime();
+    // if (sentNchem != 0)
+    // 	for (int i = 0; i < DLB.sendTo.size(); i++)
+    // 	{
+    // 		int start1 = std::accumulate(DLB.transferNmesh.begin() +
+    // DLB.sendTo[0], DLB.transferNmesh.begin() + DLB.sendTo[i], 0) * (5 + 3 *
+    // TwoDim.NS); 		int start2 = std::accumulate(DLB.transferNmesh.begin() +
+    // DLB.sendTo[0], DLB.transferNmesh.begin() + DLB.sendTo[i], 0); 		int size1 =
+    // DLB.transferNmesh[DLB.sendTo[i]] * (5 + 3 * TwoDim.NS); 		int size2 =
+    // DLB.transferNmesh[DLB.sendTo[i]]; 		if (size2 != 0)
+    // 		{
+    // 			MPI_Isend(&DLB.prevFlowDataLocal[start1], size1,
+    // MPI_DOUBLE, std::get<1>(DLB.transferNchem[DLB.sendTo[i]]), 					  DLB.sendTo[i],
+    // MPI_COMM_WORLD, &sendRequests1[DLB.sendTo[i]]);
+    // 			MPI_Isend(&DLB.prevReactDataLocal[start2], size2,
+    // MPI_INT, std::get<1>(DLB.transferNchem[DLB.sendTo[i]]), 					  DLB.sendTo[i] +
+    // 10000, MPI_COMM_WORLD, &sendRequests2[DLB.sendTo[i]]);
+    // 		}
+    // 	}
+    double ttt2 = MPI_Wtime();
+    // MPI_Win_fence(0, win_prevFlowData);
+    // MPI_Win_fence(0, win_prevReactData);
+    int recvNmesh = DLB.GetRecvNmesh(myid);
+    /* Unpackage update data */
+    if (recvNmesh != 0) {
+      MPI_Win_start(sendGroup, 0, win_prevFlowData);
+      MPI_Win_start(sendGroup, 0, win_prevReactData);
+
+      // for (auto &id : DLB.sendId)
+      // {
+      // 	MPI_Win_lock(MPI_LOCK_SHARED, id, 0, win_prevFlowData);
+      // 	MPI_Win_lock(MPI_LOCK_SHARED, id, 0, win_prevReactData);
+      // }
+
+      DLB.recvPrevFlowData.clear();
+      DLB.recvPrevReactData.clear();
+      DLB.recvPrevFlowData.resize(recvNmesh * (5 + 3 * TwoDim.NS));
+      DLB.recvPrevReactData.resize(recvNmesh);
+      for (int i = 0; i < DLB.recvFrom.size(); i++) {
+        int start1 =
+            std::accumulate(DLB.transferNmesh.begin() + DLB.recvFrom[0],
+                            DLB.transferNmesh.begin() + DLB.recvFrom[i], 0) *
+            (5 + 3 * TwoDim.NS);
+        int start2 =
+            std::accumulate(DLB.transferNmesh.begin() + DLB.recvFrom[0],
+                            DLB.transferNmesh.begin() + DLB.recvFrom[i], 0);
+        int size1 = DLB.transferNmesh[DLB.recvFrom[i]] * (5 + 3 * TwoDim.NS);
+        int size2 = DLB.transferNmesh[DLB.recvFrom[i]];
+        std::vector<int> _sendTo =
+            DLB.GetSentTo(std::get<0>(DLB.transferNchem[DLB.recvFrom[i]]));
+        int _index = Global::findIndex(_sendTo, DLB.recvFrom[i]);
+        int disp1 =
+            std::accumulate(DLB.transferNmesh.begin() + _sendTo[0],
+                            DLB.transferNmesh.begin() + _sendTo[_index], 0) *
+            (5 + 3 * TwoDim.NS);
+        int disp2 =
+            std::accumulate(DLB.transferNmesh.begin() + _sendTo[0],
+                            DLB.transferNmesh.begin() + _sendTo[_index], 0);
+        if (size2 != 0) {
+          MPI_Get(&DLB.recvPrevFlowData[start1], size1, MPI_DOUBLE,
+                  std::get<0>(DLB.transferNchem[DLB.recvFrom[i]]), disp1, size1,
+                  MPI_DOUBLE, win_prevFlowData);
+          MPI_Get(&DLB.recvPrevReactData[start2], size2, MPI_INT,
+                  std::get<0>(DLB.transferNchem[DLB.recvFrom[i]]), disp2, size2,
+                  MPI_INT, win_prevReactData);
+        }
+
+        // if (size2 != 0)
+        // {
+        // 	MPI_Recv(&DLB.recvPrevFlowData[start1], size1, MPI_DOUBLE,
+        // std::get<0>(DLB.transferNchem[DLB.recvFrom[i]]), 			 DLB.recvFrom[i],
+        // MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        // 	MPI_Recv(&DLB.recvPrevReactData[start2], size2, MPI_INT,
+        // std::get<0>(DLB.transferNchem[DLB.recvFrom[i]]), 			 DLB.recvFrom[i] +
+        // 10000, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        // 	// MPI_Irecv(&DLB.recvPrevFlowData[start1], size1, MPI_DOUBLE,
+        // std::get<0>(DLB.transferNchem[DLB.recvFrom[i]]),
+        // 	// 		  DLB.recvFrom[i], MPI_COMM_WORLD,
+        // &recvRequests1[DLB.recvFrom[i]]);
+        // 	// MPI_Irecv(&DLB.recvPrevReactData[start2], size2, MPI_INT,
+        // std::get<0>(DLB.transferNchem[DLB.recvFrom[i]]),
+        // 	// 		  DLB.recvFrom[i] + 10000, MPI_COMM_WORLD,
+        // &recvRequests2[DLB.recvFrom[i]]);
+        // }
+      }
+      MPI_Win_complete(win_prevFlowData);
+      MPI_Win_complete(win_prevReactData);
+      // for (auto &id : DLB.sendId)
+      // {
+      // 	MPI_Win_unlock(id, win_prevFlowData);
+      // 	MPI_Win_unlock(id, win_prevReactData);
+      // }
+    } else {
+      MPI_Win_post(recvGroup, 0, win_prevFlowData);
+      MPI_Win_post(recvGroup, 0, win_prevReactData);
+      MPI_Win_wait(win_prevFlowData);
+      MPI_Win_wait(win_prevReactData);
+    }
+
+    MPI_Win_fence(0, win_prevFlowData);
+    MPI_Win_fence(0, win_prevReactData);
+    MPI_Win_free(&win_prevFlowData);
+    MPI_Win_free(&win_prevReactData);
+    MPI_Group_free(&sendGroup);
+    MPI_Group_free(&recvGroup);
+  }
+}
